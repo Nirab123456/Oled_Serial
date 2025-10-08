@@ -1,4 +1,7 @@
+// OledLogger.cpp
 #include "OledLogger.h"
+#include <algorithm> // for std::min/std::max
+#include <string.h>  // for strncpy
 
 // Static member definitions
 TaskHandle_t      OledLogger::_taskHandle = nullptr;
@@ -35,7 +38,7 @@ bool OledLogger::begin(uint8_t i2c_addr,
     Wire.begin();
   }
 
-  // allocate display instance (use new so we can pick width/height at runtime)
+  // allocate display instance
   _display = new Adafruit_SSD1306((uint8_t)_width, (uint8_t)_height, &Wire, -1);
   if (!_display) {
     Serial.println("OLED: memory allocation failed");
@@ -50,7 +53,7 @@ bool OledLogger::begin(uint8_t i2c_addr,
   }
 
   _display->clearDisplay();
-  _display->setTextSize(1);
+  _display->setTextSize(1);           // fixed text size (adjust here if you will use a different text size)
   _display->setTextColor(SSD1306_WHITE);
   _display->setCursor(0, 0);
   _display->display();
@@ -68,7 +71,7 @@ bool OledLogger::begin(uint8_t i2c_addr,
   BaseType_t created = xTaskCreatePinnedToCore(
       &OledLogger::taskFunc,
       "OLED_DEBUGGER",
-      4096, // stack size - keep reasonably large for display operations and buffer printing
+      4096,
       nullptr,
       task_priority,
       &_taskHandle,
@@ -88,15 +91,13 @@ bool OledLogger::begin(uint8_t i2c_addr,
 
 void OledLogger::sendOrDropOldest(const msg_t &m)
 {
-  // Try to send without blocking
   if (xQueueSend(_queue, &m, 0) == pdTRUE) return;
 
-  // Queue full: remove one oldest entry and try again
+  // Queue full: remove one oldest entry and try again (drop oldest policy)
   msg_t tmp;
   if (xQueueReceive(_queue, &tmp, 0) == pdTRUE) {
-    // dropped the oldest
+    // dropped
   }
-  // try send again (best effort)
   xQueueSend(_queue, &m, 0);
 }
 
@@ -117,7 +118,6 @@ BaseType_t OledLogger::logFromISR(const char* utf8msg)
 {
   if (!_queue) return pdFALSE;
   msg_t m;
-  // safe copy
   strncpy(m.txt, utf8msg, sizeof(m.txt) - 1);
   m.txt[sizeof(m.txt) - 1] = '\0';
 
@@ -131,47 +131,47 @@ void OledLogger::taskFunc(void* pv)
 {
   (void)pv;
   if (!_display) {
-    // nothing we can do
     vTaskDelete(nullptr);
     return;
   }
 
-  // compute number of lines based on font height (8 px per line at textSize=1)
-  const int lineHeight = 8 * _display->getTextSize(); // getTextSize() returns text size but Adafruit doesn't provide getter; we assume 1
-  // To be safe, use 8px lines with textSize 1 (this code uses textSize 1 from begin())
-  const int LINES = max(1, _height / 8);
+  // TEXT_SIZE: keep explicit and deterministic
+  const int TEXT_SIZE = 1;              // change if you intentionally use a different text size
+  const int LINE_HEIGHT = 8 * TEXT_SIZE; // 8 px per font line for textSize=1
 
-  // circular buffer of recent messages
-  const int MSG_CAP = LINES;
-  char lines[32][sizeof(msg_t::txt)]; // support up to 32 lines if display larger; but we'll only use LINES
-  if (LINES > 32) {
-    // clamp (safety)
-  }
-  for (int i = 0; i < MSG_CAP; ++i) lines[i][0] = '\0';
-  int writeIndex = -1; // index of newest message
+  // Maximum number of lines we can reasonably store in RAM (safe upper bound)
+  const int MAX_LINES = 16;
+
+  // Compute how many lines fit on the display, clamp to MAX_LINES
+  int LINES = _height / LINE_HEIGHT;
+  LINES = std::max(1, std::min(LINES, MAX_LINES));
+
+  // Circular buffer for lines: fixed-size array
+  static char lines[MAX_LINES][sizeof(msg_t::txt)];
+  // Initialize buffer
+  for (int i = 0; i < MAX_LINES; ++i) lines[i][0] = '\0';
+
+  int writeIndex = -1; // newest message index (circular)
 
   msg_t incoming;
   for (;;) {
-    // wait indefinitely for the next message
     if (xQueueReceive(_queue, &incoming, portMAX_DELAY) == pdTRUE) {
-      // advance write index in circular manner
-      writeIndex = (writeIndex + 1) % MSG_CAP;
+      writeIndex = (writeIndex + 1) % LINES;
       strncpy(lines[writeIndex], incoming.txt, sizeof(incoming.txt));
-      lines[writeIndex][sizeof(incoming.txt)-1] = '\0';
+      lines[writeIndex][sizeof(incoming.txt) - 1] = '\0';
 
-      // redraw display: show messages oldest->newest
+      // redraw display: oldest -> newest
       _display->clearDisplay();
-      _display->setTextSize(1);
+      _display->setTextSize(TEXT_SIZE);
       _display->setTextColor(SSD1306_WHITE);
 
-      int start = (writeIndex + 1) % MSG_CAP; // oldest message
+      int start = (writeIndex + 1) % LINES; // index of the oldest stored message
       for (int i = 0; i < LINES; ++i) {
-        int idx = (start + i) % MSG_CAP;
-        _display->setCursor(0, i * 8); // 8 px per line
+        int idx = (start + i) % LINES;
+        _display->setCursor(0, i * LINE_HEIGHT);
         _display->println(lines[idx]);
       }
       _display->display();
     }
   }
-  // task never returns
 }
