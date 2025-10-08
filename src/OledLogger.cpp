@@ -1,6 +1,8 @@
+// OledLogger.cpp  -- patched for deterministic, artifact-free rendering
 #include "OledLogger.h"
 #include <algorithm> // for std::min/std::max
 #include <string.h>  // for strncpy
+#include <Arduino.h>
 
 // Static member definitions
 TaskHandle_t      OledLogger::_taskHandle = nullptr;
@@ -61,7 +63,7 @@ bool OledLogger::begin(uint8_t i2c_addr,
   _display->cp437(false);                   // normal ASCII mapping (avoid CP437 remap)
   _display->setTextWrap(false);             // we handle wrap/clip manually
   _display->display();
-  _display->setContrast(0xFF);
+  // removed _display->setContrast(0xFF);  <-- not available in this Adafruit SSD1306 build
 
   // create queue
   _queue = xQueueCreate((UBaseType_t)_queue_len, sizeof(msg_t));
