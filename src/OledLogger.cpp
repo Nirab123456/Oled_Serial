@@ -1,4 +1,3 @@
-// OledLogger.cpp
 #include "OledLogger.h"
 #include <algorithm> // for std::min/std::max
 #include <string.h>  // for strncpy
@@ -37,6 +36,8 @@ bool OledLogger::begin(uint8_t i2c_addr,
   } else {
     Wire.begin();
   }
+  // Use safe I2C clock (many cheap modules misbehave at 400kHz)
+  Wire.setClock(100000);
 
   // allocate display instance
   _display = new Adafruit_SSD1306((uint8_t)_width, (uint8_t)_height, &Wire, -1);
@@ -52,11 +53,15 @@ bool OledLogger::begin(uint8_t i2c_addr,
     return false;
   }
 
+  // Stable, deterministic display config
   _display->clearDisplay();
-  _display->setTextSize(1);           // fixed text size (adjust here if you will use a different text size)
-  _display->setTextColor(SSD1306_WHITE);
-  _display->setCursor(0, 0);
+  _display->setRotation(0);
+  _display->setTextSize(1);                 // fixed text size
+  _display->setTextColor(SSD1306_WHITE);    // draw white pixels
+  _display->cp437(false);                   // normal ASCII mapping (avoid CP437 remap)
+  _display->setTextWrap(false);             // we handle wrap/clip manually
   _display->display();
+  _display->setContrast(0xFF);
 
   // create queue
   _queue = xQueueCreate((UBaseType_t)_queue_len, sizeof(msg_t));
@@ -111,6 +116,14 @@ void OledLogger::logf(const char* fmt, ...)
   vsnprintf(m.txt, sizeof(m.txt), fmt, ap);
   va_end(ap);
 
+  // Ensure string is printable ASCII only (strip control chars)
+  for (size_t i = 0; i < sizeof(m.txt); ++i) {
+    if ((unsigned char)m.txt[i] < 0x20) {
+      if (m.txt[i] == '\0') break;
+      m.txt[i] = '?';
+    }
+  }
+
   sendOrDropOldest(m);
 }
 
@@ -120,6 +133,14 @@ BaseType_t OledLogger::logFromISR(const char* utf8msg)
   msg_t m;
   strncpy(m.txt, utf8msg, sizeof(m.txt) - 1);
   m.txt[sizeof(m.txt) - 1] = '\0';
+
+  // sanitize control chars that may corrupt glyph rendering
+  for (size_t i = 0; i < sizeof(m.txt); ++i) {
+    if ((unsigned char)m.txt[i] < 0x20) {
+      if (m.txt[i] == '\0') break;
+      m.txt[i] = '?';
+    }
+  }
 
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   BaseType_t res = xQueueSendFromISR(_queue, &m, &xHigherPriorityTaskWoken);
@@ -136,7 +157,7 @@ void OledLogger::taskFunc(void* pv)
   }
 
   // TEXT_SIZE: keep explicit and deterministic
-  const int TEXT_SIZE = 1;              // change if you intentionally use a different text size
+  const int TEXT_SIZE = 1;               // must match begin() setting
   const int LINE_HEIGHT = 8 * TEXT_SIZE; // 8 px per font line for textSize=1
 
   // Maximum number of lines we can reasonably store in RAM (safe upper bound)
@@ -148,15 +169,20 @@ void OledLogger::taskFunc(void* pv)
 
   // Circular buffer for lines: fixed-size array
   static char lines[MAX_LINES][sizeof(msg_t::txt)];
-  // Initialize buffer
-  for (int i = 0; i < MAX_LINES; ++i) lines[i][0] = '\0';
+  // Initialize buffer (only once)
+  static bool initOnce = false;
+  if (!initOnce) {
+    for (int i = 0; i < MAX_LINES; ++i) lines[i][0] = '\0';
+    initOnce = true;
+  }
 
   int writeIndex = -1; // newest message index (circular)
-
   msg_t incoming;
+
   for (;;) {
     if (xQueueReceive(_queue, &incoming, portMAX_DELAY) == pdTRUE) {
       writeIndex = (writeIndex + 1) % LINES;
+      // copy safely
       strncpy(lines[writeIndex], incoming.txt, sizeof(incoming.txt));
       lines[writeIndex][sizeof(incoming.txt) - 1] = '\0';
 
@@ -165,13 +191,23 @@ void OledLogger::taskFunc(void* pv)
       _display->setTextSize(TEXT_SIZE);
       _display->setTextColor(SSD1306_WHITE);
 
-      int start = (writeIndex + 1) % LINES; // index of the oldest stored message
+      // Compute oldest index in circular buffer
+      int start = (writeIndex + 1) % LINES;
+
       for (int i = 0; i < LINES; ++i) {
         int idx = (start + i) % LINES;
+
+        // CLEAR the line background before printing the new text to avoid leftover pixels
+        _display->fillRect(0, i * LINE_HEIGHT, _width, LINE_HEIGHT, SSD1306_BLACK);
+
+        // Ensure cursor at the start of the line and print (use print, not println)
         _display->setCursor(0, i * LINE_HEIGHT);
-        _display->println(lines[idx]);
+        _display->print(lines[idx]); // no println -> deterministic X/Y
       }
+
+      // finally push to hardware once per frame (faster and avoids flicker)
       _display->display();
     }
   }
+  // never returns
 }
